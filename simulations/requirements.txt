@@ -1,0 +1,6 @@
+expressomd
+matplotlib
+numpy
+pickle
+scipy
+sh
