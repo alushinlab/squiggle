@@ -1,81 +1,71 @@
 import numpy as np
-import os.path as op
-import sh
-import pickle
-from threading import Thread
 import espressomd
 from espressomd import thermostat
-from espressomd import integrate
 from espressomd.interactions import HarmonicBond, AngleHarmonic, Dihedral
-from espressomd import observables
-
 import util
 
-required_features = ["EXTERNAL_FORCES", "MASS"]
-espressomd.assert_features(required_features)
+box_l = [500, 500, 1500]
+part_num = 400
+kT = 1.0
+gamma = 123
+seed = 2
 
-box_l = 3 * [1500]  # nm
-n_part = 400
-
-r = 1.5  # Radius of each particle/subunit in nm
-part_i = np.array(list(range(n_part)))
-z0_i = 2.78 * part_i  # Axial translocation of protomer is 2.78 nm
-theta_i = - 166.67 / 180 * np.pi * part_i  # Rotation angle around the helical axis is 166.67 degrees
+r = 1.6  # Distance from particle center to filament axis, length unit nm
+ind_i = np.array(list(range(part_num)))
+z0_i = 2.78 * ind_i  # Helical rise
+theta_i = - 166.67 / 180 * np.pi * ind_i  # Helical twist
 x0_i = r * np.cos(theta_i)
 y0_i = r * np.sin(theta_i)
 
-# Calculate the lateral and axial bond length
-r_lateral = np.sqrt((x0_i[1] - x0_i[0]) ** 2 + (y0_i[1] - y0_i[0]) ** 2 +
-                    (z0_i[1] - z0_i[0]) ** 2)
-r_axial = np.sqrt((x0_i[2] - x0_i[0]) ** 2 + (y0_i[2] - y0_i[0]) ** 2 +
-                  (z0_i[2] - z0_i[0]) ** 2)
-
 # Move the actin filament to the center of the box
-z_i = z0_i + box_l[2] / 2 - 2.78 * n_part / 2
+z_i = z0_i + box_l[2] / 2 - 2.78 * part_num / 2
 x_i = x0_i + box_l[0] / 2
 y_i = y0_i + box_l[1] / 2
+pos_i = np.stack((x_i, y_i, z_i), axis=1)
 
+# Calculate the diagonal and longitudinal bond length
+r_diag = np.linalg.norm(pos_i[1] - pos_i[0], axis=-1)
+r_long = np.linalg.norm(pos_i[2] - pos_i[0], axis=-1)
+
+# Set up system
 system = espressomd.System(box_l=box_l)
-system.time_step = 0.1  # time scale unit is ps
-system.cell_system.skin = 0.01  # nm
-
-# kT=2.44 at 20 celsius and 293.15 kelvin
-# Use kT=0, gamma=10 to scan spring constants for harmonic bond potentials in a stretched actin
-# Use kT=2.44, gamma=25151 pN*ps/nm to scan spring constants for harmonic angle potentials and dihedral potentials in an actin undergoing thermal fluctuation
-system.thermostat.set_langevin(kT=0, gamma=0, seed=42)
+system.time_step = 0.01  # time unit 0.1 ns
+system.cell_system.skin = 0.01
+system.thermostat.set_langevin(kT=kT, gamma=gamma, seed=seed)
 
 # Set up particles
-pos_i = np.stack((x_i, y_i, z_i), axis=1)
-mass_i = 42051 * np.ones_like(part_i)
-system.part.add(id=part_i[::2], pos=pos_i[::2], mass=mass_i[::2], type=np.zeros_like(part_i[::2]))
-system.part.add(id=part_i[1::2], pos=pos_i[1::2], mass=mass_i[1::2], type=np.ones_like(part_i[1::2]))
-
-# Set up integration
-int_steps = 100
-int_iterations = 20000
+# Use type to specify particles on each strand
+system.part.add(id=ind_i[::2], pos=pos_i[::2], type=np.zeros_like(ind_i[::2]))
+system.part.add(id=ind_i[1::2], pos=pos_i[1::2], type=np.ones_like(ind_i[1::2]))
 
 # Set harmonic bond potentials
-bond_lateral = HarmonicBond(k=53, r_0=r_lateral)
-bond_axial = HarmonicBond(k=265, r_0=r_axial)
-system.bonded_inter[0] = bond_lateral
-system.bonded_inter[1] = bond_axial
+# Use optimum tensile params
+k_long = 20
+tensile_factor = 15
+k_diag = k_long * tensile_factor
+bond_diag = HarmonicBond(k=k_diag, r_0=r_diag)
+bond_long = HarmonicBond(k=k_long, r_0=r_long)
+system.bonded_inter[0] = bond_diag
+system.bonded_inter[1] = bond_long
 
 # Add harmonic bond potential
-for i in range(n_part - 1):
-    system.part.by_id(i).add_bond((bond_lateral, system.part.by_id(i + 1)))
-for i in range(n_part - 2):
-    system.part.by_id(i).add_bond((bond_axial, system.part.by_id(i + 2)))
-
+for i in range(part_num - 1):
+    system.part.by_id(i).add_bond((bond_diag, system.part.by_id(i + 1)))
+for i in range(part_num - 2):
+    system.part.by_id(i).add_bond((bond_long, system.part.by_id(i + 2)))
 
 # Set harmonic angle potentials
+# Use optimum bending params
+k_bending = 145
+bending_factor = 1
+
 # Treat particle2 as the center particle
-k_bending = 300
-angle_021 = AngleHarmonic(bend=4*k_bending, phi0=util.bond_angle(pos_i[0], pos_i[2], pos_i[1]))
-angle_023 = AngleHarmonic(bend=2*k_bending, phi0=util.bond_angle(pos_i[0], pos_i[2], pos_i[3]))
+angle_021 = AngleHarmonic(bend=3*bending_factor*k_bending, phi0=util.bond_angle(pos_i[0], pos_i[2], pos_i[1]))
+angle_023 = AngleHarmonic(bend=2*bending_factor*k_bending, phi0=util.bond_angle(pos_i[0], pos_i[2], pos_i[3]))
 angle_024 = AngleHarmonic(bend=k_bending, phi0=util.bond_angle(pos_i[0], pos_i[2], pos_i[4]))
-angle_123 = AngleHarmonic(bend=8*k_bending, phi0=util.bond_angle(pos_i[1], pos_i[2], pos_i[3]))
-angle_124 = AngleHarmonic(bend=2*k_bending, phi0=util.bond_angle(pos_i[1], pos_i[2], pos_i[4]))
-angle_324 = AngleHarmonic(bend=4*k_bending, phi0=util.bond_angle(pos_i[3], pos_i[2], pos_i[4]))
+angle_123 = AngleHarmonic(bend=4*bending_factor*k_bending, phi0=util.bond_angle(pos_i[1], pos_i[2], pos_i[3]))
+angle_124 = AngleHarmonic(bend=2*bending_factor*k_bending, phi0=util.bond_angle(pos_i[1], pos_i[2], pos_i[4]))
+angle_324 = AngleHarmonic(bend=3*bending_factor*k_bending, phi0=util.bond_angle(pos_i[3], pos_i[2], pos_i[4]))
 
 system.bonded_inter[2] = angle_021
 system.bonded_inter[3] = angle_023
@@ -87,7 +77,7 @@ system.bonded_inter[7] = angle_324
 # Add harmonic angle potential
 # part[i] should always be the vertex of the angle
 # i.e. the center particle of the triplet
-for i in range(2, n_part - 2):
+for i in range(2, part_num - 2):
     system.part.by_id(i).add_bond((angle_021, system.part.by_id(i - 2), system.part.by_id(i - 1)))
     system.part.by_id(i).add_bond((angle_023, system.part.by_id(i - 2), system.part.by_id(i + 1)))
     system.part.by_id(i).add_bond((angle_024, system.part.by_id(i - 2), system.part.by_id(i + 2)))
@@ -96,21 +86,24 @@ for i in range(2, n_part - 2):
     system.part.by_id(i).add_bond((angle_324, system.part.by_id(i + 1), system.part.by_id(i + 2)))
 
 # Set dihedral potentials
+# Use optimum dihedral params
+k_twisting = 55
+twisting_factor = 20
+
 # Dihedral angle with the connection between particles 1&2 as the edge
-# This dihedral is the main regulator of the twisting/untwisting of F-actin
-k_twisting = 150
 dihedral_edge12 = Dihedral(
-    bend=k_twisting, mult=1, phase=util.dihedral_angle(pos_i[0], pos_i[1], pos_i[2], pos_i[3]))
+    bend=twisting_factor*k_twisting, mult=1, phase=util.dihedral_angle(pos_i[0], pos_i[1], pos_i[2], pos_i[3]))
 
 # Dihedral angle with the connection between particles 0&3 as the edge
+# This dihedral is the main regulator of the twisting/untwisting of long-pitched strands
 dihedral_edge03 = Dihedral(
-    bend=(5*k_twisting), mult=1, phase=util.dihedral_angle(pos_i[2], pos_i[0], pos_i[3], pos_i[1]))
+    bend=k_twisting, mult=1, phase=util.dihedral_angle(pos_i[2], pos_i[0], pos_i[3], pos_i[1]))
 
 system.bonded_inter[8] = dihedral_edge12
 system.bonded_inter[9] = dihedral_edge03
 
 # Add dihedral potentials
-for i in range(n_part - 3):
+for i in range(part_num - 3):
     system.part.by_id(i + 1).add_bond((
         dihedral_edge12,
         system.part.by_id(i),
